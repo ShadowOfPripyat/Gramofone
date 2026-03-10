@@ -181,6 +181,13 @@
     <string name="pitch">Pitch</string>
     <string name="tempo_pitch_value">%s: %.2fx</string>
     <string name="lock_tempo_pitch">Lock tempo and pitch</string>
+    <string name="use_semitone_mode">Use semitone mode</string>
+    <string name="remember_playback_pitch">Remember pitch settings</string>
+    <string name="remember_playback_per_song">Remember for this song</string>
+    <string name="remember_playback_session">Remember for this session</string>
+    <string name="pitch_semitone_value">%.2fst</string>
+    <string name="pitch_percent_value">%.0f%%</string>
+    <string name="tempo_bpm_info">BPM: %d → %d</string>
     <string name="reset">Reset</string>
     <string name="current_playlist">Current playlist</string>
     <string name="fgs_failed_title">Failed to resume music playback</string>

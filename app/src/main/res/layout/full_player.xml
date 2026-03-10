@@ -31,13 +31,16 @@
 
     <com.google.android.material.button.MaterialButton
         android:id="@+id/playback_speed"
-        android:layout_width="52dp"
+        android:layout_width="wrap_content"
         android:layout_height="52dp"
+        android:minWidth="72dp"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
         android:layout_marginEnd="24dp"
         android:background="@drawable/rp_buttons"
         android:contentDescription="@string/playback_speed"
         app:icon="@drawable/ic_speed"
-        app:iconGravity="textStart"
+        app:iconGravity="textEnd"
         app:iconPadding="0dp"
         app:iconSize="24dp"
         app:iconTint="?attr/colorOnSurface"
@@ -48,6 +51,19 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintVertical_bias="0.0"
         app:tooltipText="@string/playback_speed" />
+
+    <TextView
+        android:id="@+id/playback_speed_label"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:minWidth="48dp"
+        android:layout_marginEnd="8dp"
+        android:gravity="center_vertical|end"
+        android:textSize="12sp"
+        android:textColor="?attr/colorOnSurface"
+        android:alpha="0"
+        app:layout_constraintBaseline_toBaselineOf="@id/playback_speed"
+        app:layout_constraintEnd_toStartOf="@id/playback_speed" />
 
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/album_cover_frame"

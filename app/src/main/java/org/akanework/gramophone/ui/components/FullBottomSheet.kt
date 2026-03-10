@@ -101,6 +101,8 @@ import uk.akane.libphonograph.items.albumId
 import uk.akane.libphonograph.items.artistId
 import uk.akane.libphonograph.manipulator.ItemManipulator
 import kotlin.math.min
+import kotlin.math.ln
+import kotlin.math.pow
 
 @SuppressLint("NotifyDataSetChanged")
 class FullBottomSheet
@@ -201,6 +203,7 @@ class FullBottomSheet
     private val bottomSheetPlaylistButton: MaterialButton
     private val bottomSheetTimerButton: MaterialButton
     private val bottomSheetPlaybackSpeedButton: MaterialButton
+    private val bottomSheetPlaybackSpeedLabel: TextView
     private val bottomSheetFavoriteButton: MaterialButton
     val bottomSheetLyricButton: MaterialButton
     private val bottomSheetFullSeekBar: SeekBar
@@ -214,6 +217,10 @@ class FullBottomSheet
     private var colorOnSecondaryContainerFinalColor: Int = -1
     private var colorContrastFaintedFinalColor: Int = -1
     private var lastDisposable: Disposable? = null
+    private val sessionSavedPitch = mutableMapOf<String, Float>()
+    // Global session-wide multiplier when "remember for this session" is used
+    private var sessionSavedGlobalPitch: Float? = null
+    private var lastMediaId: String? = null
 
     init {
         inflate(context, R.layout.full_player, this)
@@ -233,6 +240,7 @@ class FullBottomSheet
         bottomSheetLoopButton = findViewById(R.id.sheet_loop)
         bottomSheetTimerButton = findViewById(R.id.timer)
         bottomSheetPlaybackSpeedButton = findViewById(R.id.playback_speed)
+        bottomSheetPlaybackSpeedLabel = findViewById(R.id.playback_speed_label)
         bottomSheetFavoriteButton = findViewById(R.id.favor)
         if (!Flags.FAVORITE_SONGS)
             bottomSheetFavoriteButton.visibility = GONE
@@ -281,6 +289,13 @@ class FullBottomSheet
         }
         refreshSettings(null)
         prefs.registerOnSharedPreferenceChangeListener(this)
+        // initialize the playback speed label to current player parameters
+        try {
+            val currentParams = instance?.playbackParameters
+            if (currentParams != null) onPlaybackParametersChanged(currentParams)
+        } catch (e: Exception) {
+            // ignore
+        }
         activity.controllerViewModel.customCommandListeners.addCallback(activity.lifecycle) { _, command, _ ->
             when (command.customAction) {
                 GramophonePlaybackService.SERVICE_TIMER_CHANGED -> updateTimer()
@@ -497,10 +512,14 @@ class FullBottomSheet
         bottomSheetTimerButton.isChecked = t?.first != null || t?.second == true
         TooltipCompat.setTooltipText(
             bottomSheetTimerButton,
-            if (t?.first != null) context.getString(
-                if (t.second) R.string.timer_expiry_eos else R.string.timer_expiry,
-                DateFormat.getTimeFormat(context).format(System.currentTimeMillis() + t.first!!)
-            ) else if (t?.second == true) context.getString(R.string.timer_expiry_end_of_this_song)
+            if (t?.first != null) {
+                val expiry = t.first
+                val expiryMillis = (expiry as? Number)?.toLong() ?: 0L
+                context.getString(
+                    if (t.second) R.string.timer_expiry_eos else R.string.timer_expiry,
+                    DateFormat.getTimeFormat(context).format(System.currentTimeMillis() + expiryMillis)
+                )
+            } else if (t?.second == true) context.getString(R.string.timer_expiry_end_of_this_song)
             else context.getString(R.string.timer)
         )
     }
@@ -563,30 +582,47 @@ class FullBottomSheet
         }
     }
 
+    // Helpers to convert between semitones and multiplier for reuse
+    private fun semitonesToMultiplier(semitones: Float): Float = 2.0.pow(semitones / 12.0).toFloat()
+    private fun multiplierToSemitones(mult: Float): Float = (12f * (ln(mult.toDouble()) / ln(2.0))).toFloat()
+
     private fun showPlaybackSpeedDialog() {
         val context = wrappedContext ?: context
-        val initialPlaybackParameters = instance!!.playbackParameters
-        val wantsToBeLocked = prefs.getBoolean("playback_tempo_pitch_locked", true)
-        val isLocked =
-            initialPlaybackParameters.pitch == initialPlaybackParameters.speed && wantsToBeLocked
+        val initialPlaybackParameters = instance?.playbackParameters ?: PlaybackParameters(1f, 1f)
 
-        val tempoSlider = Slider(context).apply {
-            valueFrom = 0.25f
-            valueTo = 4.0f
-            stepSize = 0.01f
-            value = initialPlaybackParameters.speed.coerceIn(0.25f, 4.0f)
+        // Determine saved per-song value (persisted) or session value
+        val mediaId = instance?.currentMediaItem?.mediaId
+        val perSongPercentKey = mediaId?.let { "playback_saved_percent_$it" }
+        val perSongMultKey = mediaId?.let { "playback_saved_mult_$it" }
+        val perSongPercent = perSongPercentKey?.let { prefs.getFloat(it, Float.NaN) }
+        val perSongMult = perSongMultKey?.let { prefs.getFloat(it, Float.NaN) }
+        val savedSessionValue = mediaId?.let { sessionSavedPitch[it] }
+        val savedSessionGlobal = sessionSavedGlobalPitch
+
+        // UI: single wide slider controlling multiplier directly (0.20x - 2.00x)
+        val speedSlider = Slider(context).apply {
+            valueFrom = 0.20f
+            valueTo = 2.00f
+            // default step 2% -> 0.02 multiplier (more resistance)
+            stepSize = 0.02f
+            // initialize: prefer session-global, then session-per-song, then persisted multiplier,
+            // then convert old percent key, else current playback speed
+            val initVal = when {
+                savedSessionGlobal != null -> savedSessionGlobal
+                savedSessionValue != null -> savedSessionValue
+                (perSongMult != null && !perSongMult.isNaN()) -> perSongMult
+                (perSongPercent != null && !perSongPercent.isNaN()) -> (1f + perSongPercent / 100f)
+                else -> initialPlaybackParameters.speed
+            }
+            value = initVal.coerceIn(valueFrom, valueTo)
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).also { layoutParams = it }
         }
 
-        val tempoText = TextView(context).apply {
-            text = context.getString(
-                R.string.tempo_pitch_value,
-                context.getString(R.string.tempo),
-                tempoSlider.value
-            )
+        val speedText = TextView(context).apply {
+            text = context.getString(R.string.tempo_pitch_value, context.getString(R.string.tempo), speedSlider.value)
             gravity = Gravity.CENTER
             textSize = 16f
             LinearLayout.LayoutParams(
@@ -595,90 +631,124 @@ class FullBottomSheet
             ).also { layoutParams = it }
         }
 
-        val pitchSlider = Slider(context).apply {
-            valueFrom = 0.25f
-            valueTo = 4.0f
-            stepSize = 0.01f
-            value = initialPlaybackParameters.pitch.coerceIn(0.25f, 4.0f)
+        // Precision radio buttons (1%,2%,5%,10%)
+        val precisionGroup = android.widget.RadioGroup(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { layoutParams = it }
+        }
+        val r1 = android.widget.RadioButton(context).apply { text = "1%"; id = 1 }
+        val r2 = android.widget.RadioButton(context).apply { text = "2%"; id = 2 }
+        val r5 = android.widget.RadioButton(context).apply { text = "5%"; id = 5 }
+        val r10 = android.widget.RadioButton(context).apply { text = "10%"; id = 10 }
+        precisionGroup.addView(r1)
+        precisionGroup.addView(r2)
+        precisionGroup.addView(r5)
+        precisionGroup.addView(r10)
+        // default selection 1%
+        r1.isChecked = true
+
+        // Remember options: per-song (persisted) and session (in-memory)
+        val rememberPerSong = MaterialCheckBox(context).apply {
+            text = context.getString(R.string.remember_playback_per_song)
+            isChecked = false
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { layoutParams = it }
+        }
+        val rememberSession = MaterialCheckBox(context).apply {
+            text = context.getString(R.string.remember_playback_session)
+            // initialize checked state from session-global value
+            isChecked = savedSessionGlobal != null
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).also { layoutParams = it }
         }
 
-        val pitchText = TextView(context).apply {
-            text = context.getString(
-                R.string.tempo_pitch_value,
-                context.getString(R.string.pitch),
-                pitchSlider.value
-            )
+        // Tempo info (BPM original -> adjusted)
+        val tempoInfo = TextView(context).apply {
+            text = ""
             gravity = Gravity.CENTER
-            textSize = 16f
+            textSize = 14f
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).also { layoutParams = it }
         }
 
-        val lockCheckbox = MaterialCheckBox(context).apply {
-            text = context.getString(R.string.lock_tempo_pitch)
-            isChecked = isLocked
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).also { layoutParams = it }
+        // Look up tempo robustly from metadata
+        fun findMetadataTempo(): Double? {
+            val extras = instance?.currentMediaItem?.mediaMetadata?.extras ?: return null
+            val keys = listOf("tempo", "bpm", "BPM", "tempo_bpm")
+            for (k in keys) {
+                if (extras.containsKey(k)) {
+                    val any = extras.get(k)
+                    when (any) {
+                        is Number -> return any.toDouble()
+                        is String -> return any.toDoubleOrNull()
+                    }
+                }
+            }
+            return null
         }
 
-        pitchSlider.isEnabled = !isLocked
-        pitchText.isEnabled = !isLocked
+        fun updateTempoInfoForMultiplier(mult: Float) {
+            val found = findMetadataTempo()
+            if (found != null && !found.isNaN()) {
+                val adjusted = (found * mult).toInt()
+                tempoInfo.text = context.getString(R.string.tempo_bpm_info, found.toInt(), adjusted)
+                tempoInfo.visibility = VISIBLE
+            } else {
+                tempoInfo.visibility = GONE
+            }
+        }
 
+        // Container with narrower side padding so slider appears wider
         val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(
-                48.dpToPx(context), 16.dpToPx(context),
-                48.dpToPx(context), 0
+                24.dpToPx(context), 8.dpToPx(context),
+                24.dpToPx(context), 0
             )
-            addView(tempoText)
-            addView(tempoSlider)
-            addView(pitchText)
-            addView(pitchSlider)
-            addView(lockCheckbox)
+            addView(speedText)
+            addView(speedSlider)
+            addView(precisionGroup)
+            addView(rememberPerSong)
+            addView(rememberSession)
+            addView(tempoInfo)
         }
 
-        tempoSlider.addOnChangeListener { _, value, fromUser ->
-            tempoText.text = context.getString(
-                R.string.tempo_pitch_value,
-                context.getString(R.string.tempo),
-                value
-            )
-            if (fromUser) {
-                if (lockCheckbox.isChecked) {
-                    pitchSlider.value = value
-                }
-                instance?.playbackParameters =
-                    PlaybackParameters(tempoSlider.value, pitchSlider.value)
+        // Precision selection updates slider.stepSize (1% -> 0.01, etc.)
+        precisionGroup.setOnCheckedChangeListener { _, checkedId ->
+            val step = when (checkedId) {
+                1 -> 0.01f
+                2 -> 0.02f
+                5 -> 0.05f
+                10 -> 0.10f
+                else -> 0.01f
             }
+            // Snap current value to nearest valid step before applying stepSize to avoid IllegalStateException
+            val current = speedSlider.value
+            val from = speedSlider.valueFrom
+            val steps = kotlin.math.round((current - from) / step)
+            val snapped = (from + steps * step).coerceIn(speedSlider.valueFrom, speedSlider.valueTo)
+            speedSlider.value = snapped
+            speedSlider.stepSize = step
         }
 
-        pitchSlider.addOnChangeListener { _, value, fromUser ->
-            pitchText.text = context.getString(
-                R.string.tempo_pitch_value,
-                context.getString(R.string.pitch),
-                value
-            )
+        // Initialize tempo info and UI
+        updateTempoInfoForMultiplier(speedSlider.value)
+
+        speedSlider.addOnChangeListener { _, value, fromUser ->
+            speedText.text = context.getString(R.string.tempo_pitch_value, context.getString(R.string.tempo), value)
             if (fromUser) {
-                instance?.playbackParameters =
-                    PlaybackParameters(tempoSlider.value, pitchSlider.value)
-            }
-        }
-
-        lockCheckbox.setOnCheckedChangeListener { _, isChecked ->
-            pitchSlider.isEnabled = !isChecked
-            pitchText.isEnabled = !isChecked
-            if (isChecked) {
-                pitchSlider.value = tempoSlider.value
-                instance?.playbackParameters =
-                    PlaybackParameters(tempoSlider.value, pitchSlider.value)
+                val mult = value
+                instance?.playbackParameters = PlaybackParameters(mult, mult)
+                updateTempoInfoForMultiplier(mult)
             }
         }
 
@@ -686,22 +756,26 @@ class FullBottomSheet
             .setTitle(R.string.playback_speed)
             .setView(NestedScrollView(context).apply { addView(container) })
             .setPositiveButton(android.R.string.ok) { _, _ ->
-                prefs.edit {
-                    putBoolean("playback_tempo_pitch_locked", lockCheckbox.isChecked)
+                // persist per-song choice if requested (store multiplier under new key)
+                if (mediaId != null && rememberPerSong.isChecked) {
+                    prefs.edit {
+                        putFloat("playback_saved_mult_$mediaId", speedSlider.value)
+                        // remove old percent key if present to avoid future ambiguity
+                        remove("playback_saved_percent_$mediaId")
+                    }
+                }
+                // session remember: keep as a global session value (applies to all songs)
+                if (rememberSession.isChecked) {
+                    sessionSavedGlobalPitch = speedSlider.value
+                } else {
+                    // clear session-global when user unchecks
+                    sessionSavedGlobalPitch = null
                 }
             }
             .setNegativeButton(android.R.string.cancel) { _, _ ->
                 instance?.playbackParameters = initialPlaybackParameters
-                if (wantsToBeLocked != isLocked) { // if external app changed speed/pitch.
-                    prefs.edit {
-                        putBoolean("playback_tempo_pitch_locked", false)
-                    }
-                }
             }
             .setNeutralButton(R.string.reset) { _, _ ->
-                prefs.edit {
-                    putBoolean("playback_tempo_pitch_locked", true)
-                }
                 instance?.playbackParameters = PlaybackParameters(1f, 1f)
             }
             .show()
@@ -728,8 +802,8 @@ class FullBottomSheet
                 WindowInsetsCompat.Type.systemBars()
                         or WindowInsetsCompat.Type.displayCutout(), Insets.NONE
             )
-            .build()
-            .toWindowInsets()!!
+                .build()
+                .toWindowInsets() ?: platformInsets
     }
 
     private fun removeColorScheme() {
@@ -738,7 +812,7 @@ class FullBottomSheet
         currentDisposable = null
         wrappedContext = null
         currentJob = CoroutineScope(Dispatchers.Default)
-        currentJob!!.launch {
+        currentJob?.launch {
             applyColorScheme()
         }
     }
@@ -1129,6 +1203,36 @@ class FullBottomSheet
                 skipAnimation = firstTime
             )
             updateDuration()
+            // Apply saved per-song or session multiplier if present (support old percent key migration)
+            try {
+                val newMediaId = mediaItem?.mediaId
+                val changed = newMediaId != lastMediaId
+                if (changed) {
+                    if (newMediaId != null) {
+                        val sessionVal = sessionSavedGlobalPitch ?: sessionSavedPitch[newMediaId]
+                        val perSongPercentKey = "playback_saved_percent_$newMediaId"
+                        val perSongMultKey = "playback_saved_mult_$newMediaId"
+                        val perSongPercentVal = prefs.getFloat(perSongPercentKey, Float.NaN)
+                        val perSongMultVal = prefs.getFloat(perSongMultKey, Float.NaN)
+                        val multToApply = when {
+                            sessionVal != null -> sessionVal
+                            !perSongMultVal.isNaN() -> perSongMultVal
+                            !perSongPercentVal.isNaN() -> 1f + perSongPercentVal / 100f
+                            else -> null
+                        }
+                        if (multToApply != null) {
+                            val mult = multToApply.coerceIn(0.20f, 2.00f)
+                            instance?.playbackParameters = PlaybackParameters(mult, mult)
+                        } else {
+                            // No saved/session value — ensure next song is at normal 1.00x
+                            instance?.playbackParameters = PlaybackParameters(1f, 1f)
+                        }
+                    }
+                }
+                lastMediaId = newMediaId
+            } catch (e: Exception) {
+                // ignore
+            }
         } else {
             lastDisposable?.dispose()
             lastDisposable = null
@@ -1288,6 +1392,19 @@ class FullBottomSheet
             if (!isUserTracking) {
                 progressDrawable.animate = false
             }
+        }
+    }
+
+    override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
+        // update the left-side label to show current speed when != 1.00x
+        val speed = playbackParameters.speed
+        if (speed != 1f) {
+            // show formatted speed and make label visible (no layout shift; alpha used)
+            bottomSheetPlaybackSpeedLabel.text = String.format("%.2fx", speed)
+            bottomSheetPlaybackSpeedLabel.alpha = 1f
+        } else {
+            bottomSheetPlaybackSpeedLabel.text = ""
+            bottomSheetPlaybackSpeedLabel.alpha = 0f
         }
     }
 
